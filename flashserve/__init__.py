@@ -1,17 +1,8 @@
-"""
-FlashServe: High-Performance LLM Inference Engine
+"""FlashServe: a from-scratch inference engine for Llama-architecture language models."""
 
-A complete, production-ready inference engine optimized for serving large language models
-with minimal latency and maximum throughput.
-"""
+__version__ = "0.2.0"
 
-__version__ = "0.1.0"
-__author__ = "FlashServe Contributors"
-
-from flashserve.model.config import LlamaConfig
 from flashserve.engine.inference_engine import InferenceEngine
+from flashserve.model.config import LlamaConfig
 
-__all__ = [
-    "LlamaConfig",
-    "InferenceEngine",
-]
+__all__ = ["LlamaConfig", "InferenceEngine"]

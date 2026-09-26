@@ -82,19 +82,22 @@ class FlashAttention(nn.Module):
             Attention output of shape (batch, seq_len, num_heads, head_dim)
             Attention weights (if needed for visualization)
         """
-        batch_size, seq_len_q, num_heads, head_dim = q.shape
-        seq_len_kv = k.shape[1]
+        seq_len_q, seq_len_kv = q.shape[1], k.shape[1]
+
+        # Kernels work in (batch, heads, seq, head_dim) so matmuls contract over
+        # the sequence/feature axes rather than across heads.
+        q_, k_, v_ = (t.transpose(1, 2) for t in (q, k, v))
 
         # For very small sequences, fall back to standard attention
         if seq_len_q * seq_len_kv < 4096:  # Threshold for tiling
-            return self._standard_attention(
-                q, k, v, causal_mask=causal_mask, attn_mask=attn_mask
+            out, weights = self._standard_attention(
+                q_, k_, v_, causal_mask=causal_mask, attn_mask=attn_mask
             )
-
-        # Use tiled attention for larger sequences
-        return self._tiled_attention(
-            q, k, v, causal_mask=causal_mask, attn_mask=attn_mask
-        )
+        else:
+            out, weights = self._tiled_attention(
+                q_, k_, v_, causal_mask=causal_mask, attn_mask=attn_mask
+            )
+        return out.transpose(1, 2).contiguous(), weights
 
     def _standard_attention(
         self,
@@ -104,9 +107,12 @@ class FlashAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Standard attention for small sequences (baseline for testing)."""
-        batch_size, seq_len_q, num_heads, head_dim = q.shape
-        seq_len_kv = k.shape[1]
+        """Standard attention for small sequences (baseline for testing).
+
+        Inputs are (batch, heads, seq, head_dim).
+        """
+        seq_len_q, head_dim = q.shape[2], q.shape[3]
+        seq_len_kv = k.shape[2]
 
         # Compute attention scores: Q @ K^T / sqrt(d)
         scores = torch.matmul(q, k.transpose(-2, -1))
@@ -144,8 +150,8 @@ class FlashAttention(nn.Module):
         Processes queries in blocks, iterating over key/value blocks.
         Uses online softmax to avoid materializing full attention matrix.
         """
-        batch_size, seq_len_q, num_heads, head_dim = q.shape
-        seq_len_kv = k.shape[1]
+        batch_size, num_heads, seq_len_q, head_dim = q.shape
+        seq_len_kv = k.shape[2]
         device = q.device
         dtype = q.dtype
 
@@ -162,17 +168,17 @@ class FlashAttention(nn.Module):
         # Process query blocks
         for q_start in range(0, seq_len_q, self.block_size):
             q_end = min(q_start + self.block_size, seq_len_q)
-            q_block = q[:, q_start:q_end, :, :]  # (batch, block_size, num_heads, head_dim)
+            q_block = q[:, :, q_start:q_end, :]  # (batch, heads, block_q, head_dim)
 
-            m_block = m[:, :, q_start:q_end]  # (batch, num_heads, block_size)
-            l_block = l[:, :, q_start:q_end]  # (batch, num_heads, block_size)
-            o_block = output[:, q_start:q_end, :, :]  # (batch, block_size, num_heads, head_dim)
+            m_block = m[:, :, q_start:q_end]  # (batch, heads, block_q)
+            l_block = l[:, :, q_start:q_end]  # (batch, heads, block_q)
+            o_block = output[:, :, q_start:q_end, :]  # (batch, heads, block_q, head_dim)
 
             # Process key/value blocks
             for kv_start in range(0, seq_len_kv, self.block_size):
                 kv_end = min(kv_start + self.block_size, seq_len_kv)
-                k_block = k[:, kv_start:kv_end, :, :]  # (batch, block_size, num_heads, head_dim)
-                v_block = v[:, kv_start:kv_end, :, :]  # (batch, block_size, num_heads, head_dim)
+                k_block = k[:, :, kv_start:kv_end, :]  # (batch, heads, block_k, head_dim)
+                v_block = v[:, :, kv_start:kv_end, :]  # (batch, heads, block_k, head_dim)
 
                 # Compute attention scores: Q @ K^T / sqrt(d)
                 scores = torch.matmul(q_block, k_block.transpose(-2, -1))  # (..., block_q, block_k)
@@ -211,7 +217,7 @@ class FlashAttention(nn.Module):
 
             # Normalize output by running sum
             o_block = o_block / (l_block[..., :, None] + 1e-10)
-            output[:, q_start:q_end, :, :] = o_block
+            output[:, :, q_start:q_end, :] = o_block
 
             # Update global running max and sum
             m[:, :, q_start:q_end] = m_block

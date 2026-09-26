@@ -10,7 +10,6 @@ import json
 from typing import Optional
 
 from flashserve.model.config import LlamaConfig
-from flashserve.model.llama import LlamaForCausalLM
 from flashserve.engine.inference_engine import InferenceEngine
 from flashserve.serving.request import (
     CompletionRequest, CompletionResponse, CompletionChoice, CompletionUsage,
@@ -19,29 +18,28 @@ from flashserve.serving.request import (
 
 
 def create_app(
-    model_name: str = "flashserve-7b",
+    model_name: str = "flashserve-tiny",
     config: Optional[LlamaConfig] = None,
     device: str = "auto",
+    engine: Optional[InferenceEngine] = None,
 ) -> FastAPI:
     """
     Create FastAPI application with inference engine.
 
     Args:
         model_name: Model name for identification
-        config: Model configuration (uses tiny by default)
+        config: Model configuration (uses tiny by default); ignored if engine is given
         device: Device to use ("cuda", "cpu", or "auto")
+        engine: Pre-built engine (e.g. with loaded weights and a matching tokenizer)
 
     Returns:
         FastAPI application
     """
     app = FastAPI(title="FlashServe", version="0.1.0")
 
-    # Initialize model
-    if config is None:
-        config = LlamaConfig.tiny()
-
-    model = LlamaForCausalLM(config)
-    engine = InferenceEngine(config, model=model, device=device)
+    if engine is None:
+        engine = InferenceEngine(config or LlamaConfig.tiny(), device=device)
+    config = engine.config
 
     @app.get("/health")
     def health():
@@ -85,24 +83,26 @@ def create_app(
             )
 
             # Format response
+            prompt_tokens = sum(engine.count_tokens(p) for p in prompts)
+            completion_tokens = sum(engine.count_tokens(o) for o in outputs)
             choices = [
                 CompletionChoice(
                     text=output,
                     index=i,
-                    finish_reason="length",
+                    finish_reason="length" if engine.count_tokens(output) >= request.max_tokens else "stop",
                 )
                 for i, output in enumerate(outputs)
             ]
 
             return CompletionResponse(
-                id=str(uuid.uuid4()),
+                id=f"cmpl-{uuid.uuid4().hex[:24]}",
                 created=int(time.time()),
                 model=request.model,
                 choices=choices,
                 usage=CompletionUsage(
-                    prompt_tokens=0,  # Would need tokenizer for accurate count
-                    completion_tokens=request.max_tokens,
-                    total_tokens=request.max_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                 ),
             )
         except Exception as e:
@@ -112,17 +112,7 @@ def create_app(
     def chat_completions(request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Chat completion endpoint (OpenAI format)."""
         try:
-            # Convert messages to prompt
-            prompt = ""
-            for msg in request.messages:
-                if msg.role == "system":
-                    prompt += f"System: {msg.content}\n"
-                elif msg.role == "user":
-                    prompt += f"User: {msg.content}\n"
-                elif msg.role == "assistant":
-                    prompt += f"Assistant: {msg.content}\n"
-
-            # Generate
+            prompt = engine.format_chat([{"role": m.role, "content": m.content} for m in request.messages])
             output = engine.generate(
                 prompt,
                 max_tokens=request.max_tokens,
@@ -130,22 +120,23 @@ def create_app(
                 top_p=request.top_p,
                 do_sample=request.temperature > 0,
             )
+            prompt_tokens, completion_tokens = engine.count_tokens(prompt), engine.count_tokens(output)
 
             return ChatCompletionResponse(
-                id=str(uuid.uuid4()),
+                id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
                 created=int(time.time()),
                 model=request.model,
                 choices=[
                     ChatCompletionChoice(
                         index=0,
                         message=ChatMessage(role="assistant", content=output),
-                        finish_reason="length",
+                        finish_reason="length" if completion_tokens >= request.max_tokens else "stop",
                     )
                 ],
                 usage=CompletionUsage(
-                    prompt_tokens=0,
-                    completion_tokens=request.max_tokens,
-                    total_tokens=request.max_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
                 ),
             )
         except Exception as e:
@@ -170,26 +161,32 @@ def create_app(
 
 
 async def _stream_completions(engine, request, prompts):
-    """Stream completions as Server-Sent Events."""
-    for prompt in prompts:
+    """Stream completions as Server-Sent Events in the OpenAI format."""
+    completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+    for index, prompt in enumerate(prompts):
         for token in engine.stream_generate(
             prompt,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
+            top_k=request.top_k,
             top_p=request.top_p,
         ):
             event = {
-                "choices": [
-                    {
-                        "text": token,
-                        "index": 0,
-                        "finish_reason": None,
-                    }
-                ],
+                "id": completion_id,
+                "object": "text_completion",
                 "created": int(time.time()),
                 "model": request.model,
+                "choices": [{"text": token, "index": index, "finish_reason": None}],
             }
             yield f"data: {json.dumps(event)}\n\n"
 
-        # Final event
-        yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+        final = {
+            "id": completion_id,
+            "object": "text_completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{"text": "", "index": index, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+
+    yield "data: [DONE]\n\n"

@@ -1,123 +1,131 @@
 """
-Weight loading utilities for HuggingFace model format conversion.
+Load Hugging Face Llama-architecture checkpoints (e.g. SmolLM2, TinyLlama) into FlashServe.
+
+Hugging Face stores q_proj/k_proj rows in the "rotate_half" RoPE layout, while
+FlashServe applies RoPE to interleaved (even, odd) pairs like Meta's reference code.
+The two are related by a fixed permutation of the rows within each head, so the
+loader permutes those two matrices once at load time and the model code stays simple.
 """
 
-import torch
-import torch.nn as nn
-from typing import Dict
 import json
 from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import torch
+
+from flashserve.model.config import LlamaConfig
+from flashserve.model.llama import LlamaForCausalLM
 
 
-def load_hf_weights(
-    model: nn.Module,
+def config_from_hf(hf: dict) -> LlamaConfig:
+    """Build a LlamaConfig from a Hugging Face config.json dict."""
+    if hf.get("model_type") not in (None, "llama"):
+        raise ValueError(f"Only Llama-architecture checkpoints are supported, got {hf.get('model_type')!r}")
+    if hf.get("rope_scaling"):
+        raise ValueError("RoPE scaling is not supported yet")
+    eos = hf.get("eos_token_id", 2)
+    return LlamaConfig(
+        hidden_size=hf["hidden_size"],
+        num_attention_heads=hf["num_attention_heads"],
+        num_key_value_heads=hf.get("num_key_value_heads", hf["num_attention_heads"]),
+        intermediate_size=hf["intermediate_size"],
+        num_hidden_layers=hf["num_hidden_layers"],
+        vocab_size=hf["vocab_size"],
+        max_position_embeddings=hf.get("max_position_embeddings", 2048),
+        norm_epsilon=hf.get("rms_norm_eps", 1e-5),
+        rope_theta=float(hf.get("rope_theta", 10000.0)),
+        attention_bias=hf.get("attention_bias", False),
+        bos_token_id=hf.get("bos_token_id", 1),
+        eos_token_id=eos[0] if isinstance(eos, list) else eos,
+        pad_token_id=hf.get("pad_token_id") or 0,
+    )
+
+
+def _hf_to_interleaved(w: torch.Tensor, n_heads: int) -> torch.Tensor:
+    """Undo the permutation Hugging Face applies to q/k projections for rotate_half RoPE."""
+    out_dim, in_dim = w.shape
+    head_dim = out_dim // n_heads
+    return w.view(n_heads, 2, head_dim // 2, in_dim).transpose(1, 2).reshape(out_dim, in_dim)
+
+
+def convert_hf_state_dict(
     state_dict: Dict[str, torch.Tensor],
-) -> None:
+    config: LlamaConfig,
+    rope_interleaved: bool = False,
+) -> Dict[str, torch.Tensor]:
     """
-    Load HuggingFace format weights into a FlashServe model.
+    Map a Hugging Face LlamaForCausalLM state dict onto FlashServe's parameters.
 
-    Args:
-        model: Target model to load weights into
-        state_dict: State dict from HuggingFace model
-    """
-    converted_state = convert_hf_state_dict(state_dict)
-    model.load_state_dict(converted_state, strict=False)
-
-
-def convert_hf_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Convert HuggingFace model state dict to FlashServe format.
-
-    Maps HuggingFace weight names to our model parameter names.
-
-    Args:
-        state_dict: Original HuggingFace state dict
-
-    Returns:
-        Converted state dict compatible with FlashServe
+    Parameter names already match (model.layers.N.self_attn.q_proj.weight, ...);
+    the only change is the q/k row permutation described in the module docstring.
     """
     converted = {}
-
-    for hf_key, tensor in state_dict.items():
-        # Skip embeddings scaling
-        if "inv_freq" in hf_key:
+    for key, tensor in state_dict.items():
+        if key.endswith("rotary_emb.inv_freq"):
             continue
-
-        # Convert layer names: model.layers.0.xxx -> layers.0.xxx
-        key = hf_key.replace("model.layers", "layers")
-        key = key.replace("model.norm", "norm")
-        key = key.replace("lm_head", "lm_head")
-
-        # Convert attention layer names
-        key = key.replace("self_attn.q_proj", "self_attn.q_proj")
-        key = key.replace("self_attn.k_proj", "self_attn.k_proj")
-        key = key.replace("self_attn.v_proj", "self_attn.v_proj")
-        key = key.replace("self_attn.o_proj", "self_attn.o_proj")
-
-        # Convert MLP layer names
-        key = key.replace("mlp.gate_proj", "mlp.gate_proj")
-        key = key.replace("mlp.up_proj", "mlp.up_proj")
-        key = key.replace("mlp.down_proj", "mlp.down_proj")
-
-        # Convert norm layer names
-        key = key.replace("input_layernorm", "input_layernorm")
-        key = key.replace("post_attention_layernorm", "post_attention_layernorm")
-
+        if not rope_interleaved and key.endswith("self_attn.q_proj.weight"):
+            tensor = _hf_to_interleaved(tensor, config.num_attention_heads)
+        elif not rope_interleaved and key.endswith("self_attn.k_proj.weight"):
+            tensor = _hf_to_interleaved(tensor, config.num_key_value_heads)
         converted[key] = tensor
-
     return converted
 
 
-def load_from_pretrained(
-    model_name_or_path: str,
-) -> Dict[str, torch.Tensor]:
-    """
-    Load weights from a HuggingFace model path or model ID.
-
-    Args:
-        model_name_or_path: Model name (e.g., 'meta-llama/Llama-2-7b') or local path
-
-    Returns:
-        State dict of the model
-    """
+def resolve_checkpoint(model_name_or_path: str) -> Path:
+    """Local directory for a model id or path (downloads from the Hub if needed)."""
+    path = Path(model_name_or_path)
+    if path.exists():
+        return path
     try:
-        from safetensors import safe_open
         from huggingface_hub import snapshot_download
-    except ImportError:
-        raise ImportError("Please install safetensors and huggingface_hub")
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("pip install huggingface_hub to download checkpoints") from e
+    return Path(snapshot_download(model_name_or_path, allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"]))
 
-    # Download model if needed
-    if not Path(model_name_or_path).exists():
-        model_path = snapshot_download(model_name_or_path)
+
+def load_state_dict(model_dir: Path) -> Dict[str, torch.Tensor]:
+    from safetensors.torch import load_file
+
+    files = sorted(model_dir.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"No .safetensors files in {model_dir}")
+    state: Dict[str, torch.Tensor] = {}
+    for f in files:
+        state.update(load_file(str(f)))
+    return state
+
+
+def from_pretrained(
+    model_name_or_path: str,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cpu",
+) -> Tuple[LlamaForCausalLM, LlamaConfig]:
+    """
+    Load a Llama-architecture checkpoint.
+
+    Example:
+        model, config = from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+    """
+    model_dir = resolve_checkpoint(model_name_or_path)
+    hf_cfg = json.loads((model_dir / "config.json").read_text())
+    config = config_from_hf(hf_cfg)
+
+    model = LlamaForCausalLM(config)
+    state = convert_hf_state_dict(load_state_dict(model_dir), config, hf_cfg.get("rope_interleaved", False))
+    tied = hf_cfg.get("tie_word_embeddings", True)
+    if tied:
+        state.pop("lm_head.weight", None)
     else:
-        model_path = model_name_or_path
+        model.lm_head.weight = torch.nn.Parameter(torch.empty_like(model.lm_head.weight))
 
-    # Load safetensors if available
-    safetensors_file = Path(model_path) / "model.safetensors"
-    if safetensors_file.exists():
-        with safe_open(str(safetensors_file), framework="pt", device="cpu") as f:
-            state_dict = {k: f.get_tensor(k) for k in f.keys()}
-        return state_dict
-
-    # Fallback to PyTorch checkpoint
-    pytorch_file = Path(model_path) / "pytorch_model.bin"
-    if pytorch_file.exists():
-        return torch.load(pytorch_file, map_location="cpu")
-
-    raise FileNotFoundError(f"No model weights found in {model_path}")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = [k for k in missing if not (tied and k == "lm_head.weight")]
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint mismatch. Missing: {missing[:5]} Unexpected: {unexpected[:5]}")
+    return model.to(device=device, dtype=dtype).eval(), config
 
 
-def estimate_model_size(state_dict: Dict[str, torch.Tensor]) -> float:
-    """
-    Estimate model size in GB.
-
-    Args:
-        state_dict: Model state dict
-
-    Returns:
-        Size in GB
-    """
-    total_params = sum(t.numel() for t in state_dict.values())
-    bytes_per_param = 4  # float32
-    size_gb = (total_params * bytes_per_param) / (1024 ** 3)
-    return size_gb
+def estimate_model_size(state_dict: Dict[str, torch.Tensor], bytes_per_param: Optional[int] = None) -> float:
+    """Size of a state dict in GB (uses each tensor's dtype unless bytes_per_param is given)."""
+    total = sum(t.numel() * (bytes_per_param or t.element_size()) for t in state_dict.values())
+    return total / (1024 ** 3)

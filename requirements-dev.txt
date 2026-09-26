@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=7.4
+httpx>=0.25
+transformers>=4.40  # only for tests/test_hf_parity.py

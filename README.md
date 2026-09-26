@@ -1,539 +1,108 @@
-# FlashServe: High-Performance LLM Inference Engine
+# FlashServe
 
-**Production-ready LLM inference with memory-efficient attention, continuous batching, and speculative decoding.**
+A from-scratch inference engine for Llama-architecture language models, written in PyTorch.
+It loads real Hugging Face checkpoints, generates with a KV cache, batches prompts of different
+lengths, supports speculative decoding, and serves an OpenAI-compatible HTTP API with streaming.
 
-## Overview
-
-FlashServe is a complete, from-scratch inference engine optimized for serving large language models with minimal latency and maximum throughput. It implements cutting-edge techniques from research papers into a working, deployable system:
-
-- **Flash Attention**: Tiled computation reduces memory I/O by O(N²) factor
-- **Paged KV-Cache**: Dynamic memory allocation prevents fragmentation
-- **Continuous Batching**: Iteration-level scheduling minimizes TTFT
-- **Speculative Decoding**: Draft model verification speeds up generation
-- **Quantization**: INT8/INT4 support reduces memory footprint
-- **Fused Kernels**: Optimized implementations with Triton or PyTorch fallback
-
-## Architecture
+Every component is checked against an independent reference in the test suite (PyTorch's fused
+attention, a complex-number RoPE, full recomputation, and Hugging Face `transformers` on a real
+checkpoint).
 
 ```
-┌─────────────────────────────────────────────────┐
-│         OpenAI-Compatible API Layer             │
-│        (FastAPI /completions, /chat)            │
-└──────────────┬──────────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────┐
-│      Request Router & Batch Manager             │
-│   (Continuous batching with dynamic scheduling) │
-└──────────────┬──────────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────┐
-│      Inference Engine Core                      │
-│  ┌────────────────────────────────────────────┐ │
-│  │ Speculative Decoding (Optional)            │ │
-│  │ ├─ Draft Model (small, fast)               │ │
-│  │ └─ Verify Model (large, accurate)          │ │
-│  └────────────────────────────────────────────┘ │
-│  ┌────────────────────────────────────────────┐ │
-│  │ KV Cache Manager (Paged)                   │ │
-│  │ ├─ Page allocation/deallocation            │ │
-│  │ ├─ Page table mapping (logical→physical)   │ │
-│  │ └─ Copy-on-write for parallel sampling     │ │
-│  └────────────────────────────────────────────┘ │
-└──────────────┬──────────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────┐
-│      Model Architecture Layer                    │
-│  ┌────────────────────────────────────────────┐ │
-│  │ Llama-2 Style Transformer                  │ │
-│  │ ├─ RMSNorm + SwiGLU                        │ │
-│  │ ├─ Rotary Position Embeddings (RoPE)      │ │
-│  │ ├─ Grouped Query Attention (GQA)           │ │
-│  │ └─ Multi-head Self-Attention               │ │
-│  └────────────────────────────────────────────┘ │
-└──────────────┬──────────────────────────────────┘
-               │
-┌──────────────▼──────────────────────────────────┐
-│         Optimized Kernels & Operations          │
-│  ├─ Flash Attention (memory-efficient)         │
-│  ├─ Fused RMSNorm                              │
-│  ├─ Fused Rotary Embeddings                    │
-│  ├─ Quantization (INT8/INT4)                   │
-│  └─ Triton/PyTorch backend                     │
-└─────────────────────────────────────────────────┘
+$ flashserve generate --model HuggingFaceTB/SmolLM2-135M-Instruct --chat \
+    --prompt "Give me one tip for writing clean Python code."
+One tip for writing clean Python code is to use the `with` statement to automatically
+close files and connections when they are no longer needed. ...
 ```
 
-## Key Performance Features
+## What is implemented
 
-### Flash Attention Algorithm
+| Component | Where | Verified by |
+|---|---|---|
+| Llama model: RMSNorm, RoPE, SwiGLU, grouped-query attention | `flashserve/model/llama.py` | logits match `transformers` on SmolLM2-135M (max abs diff 2.5e-5) |
+| Hugging Face checkpoint loader (safetensors, config.json, tokenizer, chat template) | `flashserve/model/weights.py` | greedy output identical to `transformers.generate` |
+| Tiled attention with online softmax (FlashAttention algorithm) | `flashserve/attention/flash_attention.py` | matches `torch.nn.functional.scaled_dot_product_attention`, causal and non-causal |
+| KV cache: prefill once, then decode one token per step | `LlamaForCausalLM.generate_iter` | identical tokens and logits to full recomputation |
+| Batched generation with left padding and a combined causal + padding mask | `InferenceEngine.generate_batch` | each row matches generating that prompt alone |
+| Sampling: temperature, top-k, top-p | `flashserve/utils/sampling.py` | per-row nucleus tests |
+| Speculative decoding (draft model proposes, target verifies in one pass) | `flashserve/engine/speculative_decoding.py` | greedy output identical to the target model; 100% acceptance with an identical draft |
+| Paged KV cache (16-token pages, page table, page reuse) | `flashserve/attention/paged_attention.py` | write/read round trip, freed pages reused |
+| Continuous-batching scheduler (prefill-first) | `flashserve/engine/continuous_batching.py` | scheduling-order tests |
+| INT8 / INT4 weight quantization | `flashserve/quantization/` | size and reconstruction-error tests |
+| OpenAI-compatible server: `/v1/completions`, `/v1/chat/completions`, SSE streaming | `flashserve/serving/server.py` | FastAPI test client |
 
-Standard attention computes the full attention matrix O(N²) memory:
-```
-S = softmax(Q @ K^T / sqrt(d))    # N×N matrix in memory!
-O = S @ V
-```
+## Benchmarks
 
-FlashServe tiles computation to reduce peak memory:
-```python
-for each block of Q (size b):
-    max_so_far = -inf
-    for each block of K,V (size b):
-        compute local S block
-        track running max for softmax (online softmax)
-    compute O block with accumulated statistics
-```
+Decode throughput on SmolLM2-135M-Instruct, 64-token prompt, 128 new tokens, greedy, float32,
+**2 vCPUs** (Intel Xeon 2.8 GHz), no GPU:
 
-**Memory savings**: O(N²) → O(N) for attention computation.
+| Mode | tokens/s |
+|---|---|
+| KV cache (prefill + decode) | 17.7 |
+| Full recomputation every step | 2.9 |
 
-### Paged KV-Cache
+The cache makes each decode step cost one token of work instead of the whole sequence, a 6.1x
+speedup at this length that grows with sequence length. Reproduce with
+`python benchmarks/bench_generate.py`.
 
-Traditional KV cache pre-allocates max_seq_len×hidden_dim per request (wasteful):
-
-```python
-# Before: Fixed allocation
-kv_cache = allocate(max_seq_len, hidden_dim)  # Wasteful for short sequences
-
-# After: Paged allocation
-page_size = 16  # tokens per page
-pages = []
-page_table = {}  # logical_block_id -> physical_block_id
-```
-
-Benefits:
-- No fragmentation (pages reused across requests)
-- Copy-on-write for parallel sampling
-- Efficient memory utilization even with varied sequence lengths
-
-### Continuous Batching
-
-Requests enter/exit at any iteration (not at epoch boundaries):
-
-```
-Iteration 0: [req_A (prefill), req_B (prefill)]
-Iteration 1: [req_A (decode), req_B (decode), req_C (prefill)]
-Iteration 2: [req_A (done), req_B (decode), req_C (decode), req_D (prefill)]
-Iteration 3: [req_B (done), req_C (decode), req_D (decode)]
-```
-
-**Benefit**: Minimize TTFT (time-to-first-token) while maintaining high throughput.
-
-### Speculative Decoding
-
-Use a small draft model to propose K tokens, verify with the large model:
-
-```python
-# Autoregressive: 1 token per iteration of large model
-for i in range(max_tokens):
-    logits = model(x)
-    token = sample(logits)
-    x = append(x, token)
-
-# Speculative: Up to K tokens per iteration of large model
-for i in range(max_tokens // K):
-    # Draft model generates K candidates
-    candidates = []
-    for j in range(K):
-        draft_logits = draft_model(x)
-        token = sample(draft_logits)
-        candidates.append(token)
-        x = append(x, token)
-
-    # Verify all K in parallel with large model
-    large_logits = large_model(x)
-    for j, token in enumerate(candidates):
-        if token matches large_logits[j]:
-            accept(token)
-        else:
-            resample_from(large_logits[j])
-            break
-```
-
-**Speedup**: ~2-3x on long sequences with proper draft model.
-
-## Performance Benchmarks
-
-(Run `python benchmarks/benchmark_throughput.py` for live results)
-
-| Configuration | Throughput | TTFT | TPOT |
-|---|---|---|---|
-| Dense 7B (FP32, batch=1) | 45 tokens/sec | 120ms | 22ms |
-| Flash Attention (7B, batch=8) | 280 tokens/sec | 85ms | 14ms |
-| INT8 Quantized (7B, batch=16) | 520 tokens/sec | 60ms | 9ms |
-| Speculative (7B+1B, batch=8) | 620 tokens/sec | 75ms | 8ms |
-
-*Benchmarks on single A100 GPU. CPU inference supported for tiny model.*
-
-## Installation
+## Quick start
 
 ```bash
-git clone https://github.com/DilpreetBansi/flashserve.git
-cd flashserve
-pip install -e .
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # or a CUDA build
+pip install -e ".[dev]"
+
+pytest -q                                          # unit tests (no downloads)
+FLASHSERVE_HF_TESTS=1 pytest -q tests/test_hf_parity.py   # compare with transformers
+
+flashserve generate --model HuggingFaceTB/SmolLM2-135M-Instruct --chat --prompt "Hello!"
+flashserve serve    --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8000
 ```
-
-**Requirements**:
-- Python 3.10+
-- PyTorch 2.0+
-- CUDA 11.8+ (optional, CPU supported for small models)
-
-## Quick Start
-
-### 1. Basic Inference
-
-```python
-from flashserve.engine import InferenceEngine
-from flashserve.model.config import LlamaConfig
-
-# Load tiny model (CPU-compatible for testing)
-config = LlamaConfig.tiny()
-engine = InferenceEngine(config)
-
-# Generate text
-prompt = "The future of AI is"
-output = engine.generate(
-    prompt,
-    max_tokens=50,
-    temperature=0.7,
-    top_p=0.95
-)
-print(output)
-```
-
-### 2. Batched Inference
-
-```python
-prompts = [
-    "Explain quantum computing in",
-    "The best programming language is",
-    "How to build a",
-]
-
-outputs = engine.generate_batch(
-    prompts,
-    max_tokens=100,
-    batch_size=3
-)
-
-for prompt, output in zip(prompts, outputs):
-    print(f"{prompt}\n{output}\n")
-```
-
-### 3. Launch Serving API
-
-```python
-# examples/04_serve_model.py
-from flashserve.serving.server import create_app
-
-app = create_app(model_name="flashserve-7b-tiny")
-# uvicorn examples/04_serve_model.py:app --port 8000
-```
-
-Then use OpenAI-compatible client:
-
-```python
-import requests
-
-response = requests.post(
-    "http://localhost:8000/v1/completions",
-    json={
-        "model": "flashserve-7b",
-        "prompt": "The future of AI",
-        "max_tokens": 100,
-        "temperature": 0.7,
-        "stream": False
-    }
-)
-
-print(response.json()["choices"][0]["text"])
-```
-
-## Module Documentation
-
-### `flashserve.attention`
-
-**flash_attention.py**: Core tiled attention implementation
-- `FlashAttention(hidden_size, num_heads, block_size=128)`: Main class
-- `forward(Q, K, V, causal_mask=True)`: Compute attention with tiling
-- Achieves O(N) memory vs O(N²) for standard attention
-- Pure PyTorch (no custom CUDA needed)
-
-**paged_attention.py**: PagedAttention KV cache management
-- `PagedKVCache(page_size=16, max_pages=10000)`: Cache manager
-- `allocate_pages(num_pages)`: Allocate fixed-size pages
-- `append_kv(page_table, key, value)`: Add to KV cache
-- `read_kv_paged(page_table, positions)`: Read with page table lookup
-
-**attention_utils.py**: Helper functions
-- `apply_rotary_pos_emb(x, positions, rope_theta)`: RoPE embeddings
-- `get_causal_mask(seq_len, device)`: Causal mask for autoregressive
-- `compute_attention_scores(Q, K, scaling)`: Compute Q @ K / sqrt(d)
-
-### `flashserve.model`
-
-**llama.py**: Llama-2 architecture from scratch
-- `RMSNorm(hidden_size, eps)`: Root mean square normalization
-- `SwiGLU(hidden_size)`: Swish-gated linear unit
-- `LlamaAttention(config)`: Multi-head attention with GQA support
-- `LlamaBlock(config)`: Transformer block (attn + FFN)
-- `LlamaModel(config)`: Full model (embeddings + layers + norm)
-- `LlamaForCausalLM(config)`: Model + lm_head for generation
-
-**config.py**: Model configurations
-- `LlamaConfig.tiny()`: 15M params, 2 layers (for testing, CPU-compatible)
-- `LlamaConfig.small()`: 110M params, 6 layers
-- `LlamaConfig.llama2_7b()`: 7B params, 32 layers (production)
-
-**weights.py**: Weight loading
-- `load_hf_weights(model, hf_model_name)`: Load from HuggingFace
-- `convert_hf_state_dict(state_dict)`: Map HF names to our model
-
-### `flashserve.engine`
-
-**inference_engine.py**: Core inference
-- `InferenceEngine(config, model=None)`: Initialize with model
-- `generate(prompt, max_tokens, temperature, top_k, top_p)`: Single generation
-- `generate_batch(prompts, **kwargs)`: Batch generation
-- `stream_generate(prompt)`: Stream tokens as generators
-
-**continuous_batching.py**: Dynamic batching
-- `ContinuousBatchingScheduler(max_batch_size, max_wait_time)`: Scheduler
-- `add_request(request)`: Add request to scheduler
-- `get_next_batch()`: Get next batch for execution
-- Prefill prioritization to minimize TTFT
-
-**speculative_decoding.py**: Draft model verification
-- `SpeculativeDecoder(large_model, draft_model, gamma=4)`: Initialize
-- `generate_with_speculation(prompt, max_tokens)`: Generate with draft+verify
-- Proper probability adjustment for rejected tokens
-
-**kv_cache.py**: Paged KV cache
-- `KVCacheManager(page_size, max_pages)`: Cache manager
-- `allocate(num_pages, request_id)`: Allocate pages for request
-- `free(request_id)`: Free pages when request completes
-- Utilization metrics and fragmentation stats
-
-**scheduler.py**: Request scheduling
-- `FCFSScheduler()`: First-come, first-served
-- `PriorityScheduler(priority_fn)`: Custom priority function
-- `preempt_request(request_id)`: Preempt lower-priority request
-
-### `flashserve.serving`
-
-**server.py**: FastAPI serving
-- `create_app(model_name, config_dict)`: Create FastAPI app
-- Endpoints:
-  - `POST /v1/completions`: Text completion (OpenAI format)
-  - `POST /v1/chat/completions`: Chat completion
-  - `GET /health`: Health check with metrics
-- Streaming with Server-Sent Events
-
-**request.py**: API dataclasses
-- `CompletionRequest`: Input format
-- `CompletionResponse`: Output format
-- `ChatMessage, ChatCompletionRequest`: Chat API
-
-**batch_manager.py**: Micro-batching
-- `BatchManager(max_batch_size, max_wait_time_ms)`: Collect requests
-- `add_request(request)`: Queue request
-- `get_next_batch()`: Return batch when ready
-
-**health.py**: Monitoring
-- `get_health_status()`: Model status, memory usage, queue depth
-- Throughput metrics (tokens/sec)
-- Request latency tracking
-
-### `flashserve.quantization`
-
-**int8_quantize.py**: INT8 weight quantization
-- `quantize_int8(tensor)`: Per-channel quantization
-- `dequantize_int8(q_tensor, scale)`: Dequantize for forward pass
-- No activation quantization (fp32 activations)
-
-**int4_quantize.py**: INT4 group quantization
-- `quantize_int4(tensor, group_size=128)`: Group-wise INT4
-- `dequantize_int4(q_tensor, scale)`: Unpack and scale
-- Matches GPTQ format for compatibility
-
-**calibration.py**: Quantization calibration
-- `calibrate_model(model, dataset, num_batches)`: Compute scales
-- Per-layer calibration for optimal precision
-
-### `flashserve.kernels`
-
-**triton_attention.py**: Triton or PyTorch attention
-- Falls back to PyTorch if Triton unavailable
-- Same interface as standard attention
-
-**fused_rmsnorm.py**: Fused normalization
-- `fused_rms_norm(x, weight, bias, eps)`: Single CUDA/CPU kernel
-
-**fused_rotary.py**: Fused RoPE
-- `fused_rotary_pos_emb(x, positions, theta)`: Combined operation
-
-**fused_silu.py**: Fused activation
-- `fused_silu(x)`: x * sigmoid(x) in one operation
-
-### `flashserve.utils`
-
-**profiler.py**: GPU/CPU profiling
-- `GPUProfiler()`: Memory and latency tracking
-- `profile_forward(model, input)`: Measure forward pass
-
-**metrics.py**: Performance metrics
-- TTFT (time-to-first-token)
-- TPOT (time-per-output-token)
-- Throughput (tokens/sec)
-
-**tokenizer.py**: Tokenizer wrapper
-- `Tokenizer(tokenizer_name)`: Load from HuggingFace
-- `encode(text) -> token_ids`
-- `decode(token_ids) -> text`
-
-**config.py**: Serving configuration
-- YAML/JSON config loading
-- Environment variable overrides
-
-## Supported Model Formats
-
-- **HuggingFace Transformers**: Automatic conversion from safetensors
-- **Ollama**: Native integration
-- **vLLM**: Compatible checkpoint format
-- **Llama.cpp**: Weight conversion utilities
-
-## Production Deployment
-
-### Docker
-
-```dockerfile
-FROM pytorch/pytorch:2.0-cuda11.8-runtime-ubuntu22.04
-WORKDIR /app
-COPY . .
-RUN pip install -e .
-CMD ["python", "-m", "uvicorn", "flashserve.serving.server:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Kubernetes
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: flashserve
-spec:
-  replicas: 3
-  template:
-    spec:
-      containers:
-      - name: flashserve
-        image: flashserve:latest
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-        ports:
-        - containerPort: 8000
-```
-
-### Performance Tuning
-
-```python
-# config/serving.yaml
-model:
-  name: "Llama-2-7B"
-  dtype: "int8"  # int8, int4, or float32
-
-batching:
-  max_batch_size: 32
-  max_wait_time_ms: 50
-  enable_continuous_batching: true
-
-cache:
-  page_size: 16
-  max_pages: 100000
-
-speculative:
-  enabled: true
-  draft_model: "Llama-2-1B"
-  gamma: 4
-
-quantization:
-  enabled: true
-  calibration_samples: 512
-```
-
-## Benchmarking
 
 ```bash
-# Attention kernel performance
-python benchmarks/benchmark_attention.py
-
-# End-to-end throughput
-python benchmarks/benchmark_throughput.py
-
-# Latency breakdown
-python benchmarks/benchmark_latency.py
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "smollm2", "messages": [{"role": "user", "content": "What is RoPE?"}], "max_tokens": 64
+}'
 ```
 
-## Testing
+## Design notes
 
-```bash
-# Run all tests
-pytest tests/ -v
+**RoPE layout.** The model rotates interleaved (even, odd) pairs, as in Meta's reference code.
+Hugging Face checkpoints store `q_proj`/`k_proj` rows in the "rotate half" order instead, so the
+loader applies the inverse row permutation once at load time. The forward pass stays simple and
+the parity test proves the two conventions line up.
 
-# Run specific test
-pytest tests/test_flash_attention.py -v
+**Why left padding.** A decoder-only model continues from the last column, so batched prompts
+are left-padded. The attention mask combines causality with key padding, and RoPE positions
+restart at 0 on each prompt's first real token, so a padded row produces exactly the tokens it
+would produce alone.
 
-# With coverage
-pytest tests/ --cov=flashserve --cov-report=html
+**Prefill-first scheduling.** The scheduler runs new prompts before the next decode step. That
+keeps time-to-first-token low, at the cost of pausing decode for requests that are already
+streaming. A short wait window (50 ms by default) groups arriving prompts into one prefill batch.
+Chunked prefill would bound those pauses and is the next thing I would add.
+
+**Speculative decoding.** The target model scores the context plus all draft tokens in one forward
+pass. Drafts are accepted with probability min(1, q/p) and the first rejection is resampled from
+max(0, q - p), which keeps the output distribution exactly the target's.
+
+## Limitations
+
+- The paged KV cache and the continuous-batching scheduler are standalone, tested components;
+  the generation loop and the server use a contiguous per-request cache.
+- Speculative decoding recomputes full forward passes and supports batch size 1.
+- CPU numbers only; there are no custom CUDA/Triton kernels.
+
+## Layout
+
+```
+flashserve/
+  model/        config, Llama model, Hugging Face loader
+  attention/    tiled attention, RoPE and masks, paged KV cache
+  engine/       inference engine, speculative decoding, scheduler
+  quantization/ INT8 / INT4
+  serving/      FastAPI server and CLI
+tests/          unit tests + optional transformers parity test
+benchmarks/     bench_generate.py (real checkpoint) and synthetic benchmarks
 ```
 
-## Research & References
-
-Implementation based on:
-
-1. **FlashAttention**: "Fast and Memory-Efficient Exact Attention with IO-Awareness" (Dao et al., 2022)
-   - Tiled computation reduces memory I/O
-   - Online softmax for numerical stability
-
-2. **PagedAttention**: "Efficient Memory Management for Large Language Model Serving" (Kwon et al., 2023)
-   - Dynamic page allocation prevents fragmentation
-   - Copy-on-write for parallel sampling
-
-3. **Speculative Decoding**: "Accelerating Large Language Model Decoding with Speculative Execution" (Leviathan et al., 2023)
-   - Draft model proposes, large model verifies
-   - Proper probability adjustment for rejection
-
-4. **Continuous Batching**: vLLM (Kwon et al., 2023)
-   - Requests enter/exit at any iteration
-   - Minimizes time-to-first-token
-
-5. **Llama Architecture**: "Llama 2: Open Foundation and Fine-Tuned Chat Models" (Touvron et al., 2023)
-   - RMSNorm for stability
-   - SwiGLU for improved activation
-   - Grouped Query Attention (GQA) for efficiency
-
-## Contributing
-
-Contributions welcome! Areas of focus:
-- Additional quantization methods (FP8, NF4)
-- Tensor parallelism support
-- Additional model architectures (Mistral, Qwen)
-- Benchmark improvements
-- Documentation
-
-## License
-
-MIT License - See LICENSE file
-
-## Citation
-
-```bibtex
-@software{flashserve2024,
-  title={FlashServe: High-Performance LLM Inference Engine},
-  author={Dilpreet Bansi},
-  year={2024},
-  url={https://github.com/DilpreetBansi/flashserve}
-}
-```
-
----
-
-**Questions?** Open an issue on GitHub or contact the maintainers.
+MIT License.

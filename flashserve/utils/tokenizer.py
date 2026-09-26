@@ -81,26 +81,23 @@ class Tokenizer:
     @classmethod
     def from_pretrained(cls, model_name: str) -> "Tokenizer":
         """
-        Load tokenizer from pretrained model.
+        Load a tokenizer.
 
         Args:
-            model_name: Model name (e.g., "gpt2", "llama")
+            model_name: "gpt2" for tiktoken's GPT-2 encoding, or a Hugging Face model
+                id / local directory containing tokenizer.json.
 
         Returns:
-            Tokenizer instance
+            Tokenizer instance (falls back to the character tokenizer if nothing loads)
         """
-        # Try to load from HuggingFace
-        try:
-            import tiktoken
+        if model_name == "gpt2":
+            try:
+                import tiktoken
 
-            if model_name == "gpt2":
-                enc = tiktoken.get_encoding("gpt2")
-                return HFTokenizer(enc)
-        except ImportError:
-            pass
-
-        # Fallback to simple tokenizer
-        return cls()
+                return HFTokenizer(tiktoken.get_encoding("gpt2"))
+            except ImportError:
+                return cls()
+        return HubTokenizer.from_pretrained(model_name)
 
 
 class HFTokenizer(Tokenizer):
@@ -115,3 +112,46 @@ class HFTokenizer(Tokenizer):
 
     def decode(self, token_ids: List[int]) -> str:
         return self.tokenizer.decode(token_ids)
+
+
+class HubTokenizer(Tokenizer):
+    """Tokenizer backed by a Hugging Face tokenizer.json (via the `tokenizers` package)."""
+
+    def __init__(self, backend, chat_template: Optional[str] = None, special: Optional[dict] = None):
+        self.backend = backend
+        self.vocab_size = backend.get_vocab_size()
+        self.chat_template = chat_template
+        self.special = special or {}
+
+    @classmethod
+    def from_pretrained(cls, model_name_or_path: str) -> "HubTokenizer":
+        import json
+        from pathlib import Path
+
+        from tokenizers import Tokenizer as _Backend
+
+        from flashserve.model.weights import resolve_checkpoint
+
+        model_dir = resolve_checkpoint(model_name_or_path)
+        backend = _Backend.from_file(str(Path(model_dir) / "tokenizer.json"))
+        cfg_path = Path(model_dir) / "tokenizer_config.json"
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        special = {k: v for k, v in cfg.items() if k.endswith("_token") and isinstance(v, str)}
+        return cls(backend, chat_template=cfg.get("chat_template"), special=special)
+
+    def encode(self, text: str) -> List[int]:
+        return self.backend.encode(text, add_special_tokens=False).ids
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.backend.decode(list(token_ids), skip_special_tokens=True)
+
+    def apply_chat_template(self, messages: List[dict], add_generation_prompt: bool = True) -> str:
+        """Render chat messages with the checkpoint's Jinja chat template."""
+        if not self.chat_template:
+            return "\n".join(m["content"] for m in messages)
+        import jinja2
+
+        env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+        return env.from_string(self.chat_template).render(
+            messages=messages, add_generation_prompt=add_generation_prompt, **self.special
+        )

@@ -12,12 +12,18 @@ Implements:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 import math
 
 from flashserve.model.config import LlamaConfig
 from flashserve.attention.flash_attention import FlashAttention, GroupedQueryAttention
-from flashserve.attention.attention_utils import apply_rotary_pos_emb, get_causal_mask
+from flashserve.attention.attention_utils import (
+    apply_rotary_pos_emb,
+    build_attention_mask,
+    get_causal_mask,
+    positions_from_mask,
+)
+from flashserve.utils.sampling import sample_next
 
 
 class RMSNorm(nn.Module):
@@ -94,65 +100,55 @@ class LlamaAttention(nn.Module):
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_kv_cache: bool = False,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass with optional KV cache for autoregressive generation.
 
         Args:
-            x: Input of shape (batch, seq_len, hidden_size)
-            positions: Position indices for RoPE
-            attention_mask: Causal mask for autoregressive attention
-            use_kv_cache: Whether to cache K,V for generation
+            x: Input of shape (batch, new_tokens, hidden_size)
+            positions: Absolute positions for RoPE, (new_tokens,) or (batch, new_tokens)
+            attention_mask: Additive mask of shape (batch or 1, 1, new_tokens, past + new_tokens)
+            use_kv_cache: Whether to return the updated K,V cache
+            past_kv: Cached (K, V) from earlier steps, each (batch, past, num_kv_heads, head_dim)
 
         Returns:
-            Output of shape (batch, seq_len, hidden_size)
-            KV cache for next iteration (if use_kv_cache=True)
+            Output of shape (batch, new_tokens, hidden_size)
+            Updated (K, V) cache if use_kv_cache=True
         """
         batch_size, seq_len, _ = x.shape
 
-        # Project to Q, K, V
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # Project to Q, K, V: (batch, seq_len, heads, head_dim)
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Reshape for multi-head attention: (batch, seq_len, num_heads, head_dim)
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Apply RoPE
+        past_len = 0 if past_kv is None else past_kv[0].shape[1]
         if positions is None:
-            positions = torch.arange(seq_len, device=x.device)
+            positions = torch.arange(past_len, past_len + seq_len, device=x.device)
 
         q = apply_rotary_pos_emb(q, positions, rope_theta=self.config.rope_theta)
         k = apply_rotary_pos_emb(k, positions, rope_theta=self.config.rope_theta)
 
-        # Prepare causal mask for autoregressive attention
+        # Keys/values are cached before GQA expansion, so the cache stays
+        # num_kv_heads wide (that is the memory saving GQA exists for).
+        if past_kv is not None:
+            k = torch.cat([past_kv[0], k], dim=1)
+            v = torch.cat([past_kv[1], v], dim=1)
+
         if attention_mask is None:
-            causal_mask = get_causal_mask(seq_len, device=x.device, dtype=x.dtype)
+            causal_mask = get_causal_mask(k.shape[1], device=x.device, dtype=x.dtype)[..., -seq_len:, :]
         else:
             causal_mask = attention_mask
 
-        # Attention
         if self.num_kv_heads < self.num_heads:
-            # Use GQA
             attn_output = self.gqa(q, k, v, causal_mask=causal_mask)
         else:
-            # Standard attention
             attn_output, _ = self.flash_attn(q, k, v, causal_mask=causal_mask)
 
-        # Reshape output: (batch, seq_len, num_heads * head_dim)
-        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
-
-        # Output projection
+        attn_output = attn_output.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
         output = self.o_proj(attn_output)
-
-        # Return KV cache for autoregressive generation
-        kv_cache = None
-        if use_kv_cache:
-            kv_cache = (k, v)
-
-        return output, kv_cache
+        return output, ((k, v) if use_kv_cache else None)
 
 
 class LlamaMLPBlock(nn.Module):
@@ -185,6 +181,7 @@ class LlamaDecoderLayer(nn.Module):
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_kv_cache: bool = False,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass with pre-norm residual connections.
@@ -198,6 +195,7 @@ class LlamaDecoderLayer(nn.Module):
             positions=positions,
             attention_mask=attention_mask,
             use_kv_cache=use_kv_cache,
+            past_kv=past_kv,
         )
         hidden_states = hidden_states + attn_output
 
@@ -225,46 +223,37 @@ class LlamaModel(nn.Module):
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         use_kv_cache: bool = False,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, Optional[list]]:
         """
         Forward pass through all layers.
 
         Args:
-            input_ids: Token IDs of shape (batch, seq_len)
-            positions: Position indices
-            attention_mask: Causal mask
-            use_kv_cache: Whether to return KV cache
+            input_ids: Token IDs of shape (batch, new_tokens)
+            positions: Absolute positions of the new tokens
+            attention_mask: Additive mask (see LlamaAttention.forward)
+            use_kv_cache: Whether to return per-layer K,V caches
+            past_key_values: Per-layer caches from a previous call
 
         Returns:
-            Hidden states of shape (batch, seq_len, hidden_size)
-            KV cache list (one per layer) or None
+            Hidden states of shape (batch, new_tokens, hidden_size)
+            List of per-layer (K, V) caches, or None
         """
-        batch_size, seq_len = input_ids.shape
-
-        # Embed tokens
         hidden_states = self.embed_tokens(input_ids)
-
-        # Get positions
-        if positions is None:
-            positions = torch.arange(seq_len, device=input_ids.device)
-
-        # Pass through all layers
         kv_caches = [] if use_kv_cache else None
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             hidden_states, kv_cache = layer(
                 hidden_states,
                 positions=positions,
                 attention_mask=attention_mask,
                 use_kv_cache=use_kv_cache,
+                past_kv=None if past_key_values is None else past_key_values[i],
             )
             if use_kv_cache:
                 kv_caches.append(kv_cache)
 
-        # Final normalization
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states, kv_caches
+        return self.norm(hidden_states), kv_caches
 
 
 class LlamaForCausalLM(nn.Module):
@@ -276,7 +265,7 @@ class LlamaForCausalLM(nn.Module):
         self.model = LlamaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        # Tie embeddings and output weights (optional but common)
+        # Tie input embeddings and output projection (as in SmolLM2 / Llama-3.2 1B).
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -284,27 +273,87 @@ class LlamaForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+    ):
         """
         Forward pass for language modeling.
 
         Args:
-            input_ids: Token IDs of shape (batch, seq_len)
-            positions: Position indices
-            attention_mask: Causal mask
+            input_ids: Token IDs of shape (batch, new_tokens)
+            positions: Absolute positions of the new tokens
+            attention_mask: Additive attention mask
+            past_key_values: Per-layer K,V caches from earlier steps
+            use_cache: If True, also return the updated caches
 
         Returns:
-            Logits of shape (batch, seq_len, vocab_size)
+            Logits of shape (batch, new_tokens, vocab_size), plus caches if use_cache
         """
-        hidden_states, _ = self.model(
+        hidden_states, caches = self.model(
             input_ids,
             positions=positions,
             attention_mask=attention_mask,
-            use_kv_cache=False,
+            use_kv_cache=use_cache,
+            past_key_values=past_key_values,
         )
         logits = self.lm_head(hidden_states)
-        return logits
+        return (logits, caches) if use_cache else logits
 
+    @torch.no_grad()
+    def generate_iter(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 100,
+        temperature: float = 0.7,
+        top_k: Optional[int] = None,
+        top_p: float = 0.95,
+        do_sample: bool = True,
+        token_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
+    ) -> Iterator[torch.Tensor]:
+        """
+        Yield one (batch,) tensor of new token ids per step.
+
+        With use_cache=True the prompt is processed once (prefill) and each later
+        step feeds only the newest token, reusing cached keys and values (decode).
+        With use_cache=False every step recomputes the whole sequence; this is the
+        slow reference path the cached path is tested against.
+        """
+        if token_mask is None:
+            token_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        dtype = self.lm_head.weight.dtype
+        caches = None
+        step_input = input_ids
+
+        for _ in range(max_new_tokens):
+            positions = positions_from_mask(token_mask)
+            mask = build_attention_mask(token_mask, dtype=dtype)
+            if use_cache and caches is not None:
+                positions = positions[:, -step_input.shape[1]:]
+                mask = mask[:, :, -step_input.shape[1]:, :]
+                logits, caches = self.forward(step_input, positions=positions, attention_mask=mask,
+                                              past_key_values=caches, use_cache=True)
+            elif use_cache:
+                logits, caches = self.forward(step_input, positions=positions, attention_mask=mask, use_cache=True)
+            else:
+                logits = self.forward(input_ids, positions=positions, attention_mask=mask)
+
+            next_tokens = sample_next(
+                logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p, do_sample=do_sample
+            )
+            # Sequences that already finished keep emitting EOS.
+            next_tokens = torch.where(finished, torch.full_like(next_tokens, self.config.eos_token_id), next_tokens)
+            yield next_tokens
+
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=1)
+            token_mask = torch.cat([token_mask, torch.ones_like(next_tokens[:, None], dtype=torch.bool)], dim=1)
+            step_input = next_tokens[:, None]
+            finished |= next_tokens == self.config.eos_token_id
+            if finished.all():
+                return
+
+    @torch.no_grad()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -313,62 +362,32 @@ class LlamaForCausalLM(nn.Module):
         top_k: Optional[int] = None,
         top_p: float = 0.95,
         do_sample: bool = True,
+        token_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
         """
         Generate tokens autoregressively.
 
         Args:
-            input_ids: Starting token IDs of shape (batch, prompt_len)
+            input_ids: Starting token IDs of shape (batch, prompt_len). Batched
+                prompts of different lengths should be left-padded.
             max_new_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
+            temperature: Sampling temperature (0 means greedy)
             top_k: Top-k sampling parameter
             top_p: Nucleus sampling parameter
             do_sample: Whether to sample (vs greedy)
+            token_mask: Optional (batch, prompt_len) bool mask, False on padding
+            use_cache: Reuse keys/values between steps (prefill + decode)
 
         Returns:
-            Generated token IDs of shape (batch, prompt_len + max_new_tokens)
+            Token IDs of shape (batch, prompt_len + generated), stopping early
+            once every sequence has produced EOS.
         """
-        batch_size = input_ids.shape[0]
-        device = input_ids.device
-
-        for _ in range(max_new_tokens):
-            # Get logits for last token
-            logits = self.forward(input_ids)
-            next_token_logits = logits[:, -1, :]
-
-            # Apply temperature
-            if temperature > 0:
-                next_token_logits = next_token_logits / temperature
-
-            # Top-k filtering
-            if top_k is not None:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                next_token_logits[indices_to_remove] = torch.finfo(next_token_logits.dtype).min
-
-            # Top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > top_p
-                sorted_indices_to_remove[..., 0] = 0  # Keep at least one token
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = torch.finfo(next_token_logits.dtype).min
-
-            # Sample or greedy
-            if do_sample:
-                probs = torch.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
-            else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
-
-            # Append to sequence
-            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=1)
-
-            # Early stopping if all sequences generated EOS
-            if (next_tokens == self.config.eos_token_id).all():
-                break
-
-        return input_ids
+        new = list(self.generate_iter(input_ids, max_new_tokens, temperature, top_k, top_p,
+                                      do_sample, token_mask, use_cache))
+        if not new:
+            return input_ids
+        return torch.cat([input_ids, torch.stack(new, dim=1)], dim=1)
 
     def get_num_params(self, trainable_only: bool = False) -> int:
         """Count total number of parameters."""

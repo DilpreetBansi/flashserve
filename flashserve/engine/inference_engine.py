@@ -2,13 +2,15 @@
 Core inference engine for text generation with support for batching and caching.
 """
 
-import torch
-import torch.nn as nn
-from typing import List, Optional, Dict, Any, Generator
+import dataclasses
 import time
+from typing import Any, Dict, Generator, List, Optional
+
+import torch
 
 from flashserve.model.config import LlamaConfig
 from flashserve.model.llama import LlamaForCausalLM
+from flashserve.utils.sampling import sample_next
 from flashserve.utils.tokenizer import Tokenizer
 
 
@@ -39,26 +41,51 @@ class InferenceEngine:
             tokenizer: Tokenizer for encoding/decoding
             device: Device to use ("cpu", "cuda", or "auto")
         """
-        self.config = config
         self.device = self._select_device(device)
 
-        # Initialize model
+        # Tokenizer first: the model's vocabulary has to cover every id it can emit.
+        self.tokenizer = tokenizer if tokenizer is not None else Tokenizer.from_pretrained("gpt2")
+        tok_vocab = getattr(self.tokenizer, "vocab_size", config.vocab_size)
+
         if model is None:
+            if tok_vocab > config.vocab_size:
+                # Randomly initialised model: size the embedding table to the tokenizer.
+                config = dataclasses.replace(config, vocab_size=tok_vocab)
             self.model = LlamaForCausalLM(config).to(self.device)
         else:
+            if tok_vocab > model.config.vocab_size:
+                raise ValueError(
+                    f"Tokenizer vocabulary ({tok_vocab}) is larger than the model's "
+                    f"({model.config.vocab_size}); pass a matching tokenizer."
+                )
             self.model = model.to(self.device)
+            config = model.config
 
+        self.config = config
         self.model.eval()
-
-        # Initialize tokenizer
-        if tokenizer is None:
-            self.tokenizer = Tokenizer.from_pretrained("gpt2")
-        else:
-            self.tokenizer = tokenizer
 
         # Statistics
         self.total_tokens_generated = 0
         self.total_inference_time = 0.0
+
+    @classmethod
+    def from_pretrained(cls, model_name_or_path: str, device: str = "auto") -> "InferenceEngine":
+        """Engine for a Hugging Face Llama-architecture checkpoint, with its own tokenizer."""
+        from flashserve.model.weights import from_pretrained
+
+        model, config = from_pretrained(model_name_or_path)
+        tokenizer = Tokenizer.from_pretrained(model_name_or_path)
+        return cls(config, model=model, tokenizer=tokenizer, device=device)
+
+    def count_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text))
+
+    def format_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Render chat messages with the tokenizer's chat template when it has one."""
+        if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
+            return self.tokenizer.apply_chat_template(messages)
+        lines = [f"{m['role'].capitalize()}: {m['content']}" for m in messages]
+        return "\n".join(lines) + "\nAssistant:"
 
     def _select_device(self, device: str) -> torch.device:
         """Select device based on availability."""
@@ -145,15 +172,19 @@ class InferenceEngine:
             batch_prompts = prompts[i:i + batch_size]
             batch_inputs = [self.tokenizer.encode(p) for p in batch_prompts]
 
-            # Pad to same length
+            # Left-pad so every prompt ends at the same position, and mask the padding
+            # out of attention (decoder-only models continue from the last column).
             max_len = max(len(x) for x in batch_inputs)
-            padded = []
+            padded, masks = [], []
             for ids in batch_inputs:
-                ids = ids + [self.config.pad_token_id] * (max_len - len(ids))
-                padded.append(ids)
+                pad = max_len - len(ids)
+                padded.append([self.config.pad_token_id] * pad + ids)
+                masks.append([False] * pad + [True] * len(ids))
 
             input_ids = torch.tensor(padded, device=self.device)
+            token_mask = torch.tensor(masks, device=self.device)
 
+            start_time = time.time()
             with torch.no_grad():
                 output_ids = self.model.generate(
                     input_ids,
@@ -162,14 +193,18 @@ class InferenceEngine:
                     top_k=top_k,
                     top_p=top_p,
                     do_sample=do_sample,
+                    token_mask=token_mask,
                 )
+            self.total_inference_time += time.time() - start_time
 
-            # Decode each sequence
-            for j, output in enumerate(output_ids):
-                start_idx = len(batch_inputs[j])
-                generated = output[start_idx:].cpu().tolist()
-                text = self.tokenizer.decode(generated)
-                results.append(text)
+            # Decode each sequence (everything after the shared prompt width),
+            # dropping anything after the first EOS.
+            for output in output_ids:
+                generated = output[max_len:].cpu().tolist()
+                if self.config.eos_token_id in generated:
+                    generated = generated[: generated.index(self.config.eos_token_id)]
+                self.total_tokens_generated += len(generated)
+                results.append(self.tokenizer.decode(generated))
 
         return results
 
@@ -194,47 +229,24 @@ class InferenceEngine:
         Yields:
             Generated tokens (as strings)
         """
-        input_ids = self.tokenizer.encode(prompt)
-        input_ids = torch.tensor([input_ids], device=self.device)
-
-        for _ in range(max_tokens):
-            with torch.no_grad():
-                logits = self.model(input_ids)
-
-            next_token_logits = logits[0, -1, :]
-
-            # Temperature
-            if temperature > 0:
-                next_token_logits = next_token_logits / temperature
-
-            # Top-k filtering
-            if top_k is not None:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1]
-                next_token_logits[indices_to_remove] = torch.finfo(next_token_logits.dtype).min
-
-            # Top-p filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cum_probs > top_p
-                sorted_indices_to_remove[..., 0] = 0
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_token_logits[indices_to_remove] = torch.finfo(next_token_logits.dtype).min
-
-            # Sample
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
-
-            # Decode and yield
-            token_text = self.tokenizer.decode([next_token])
-            yield token_text
-
-            # Append to sequence
-            input_ids = torch.cat([input_ids, torch.tensor([[next_token]], device=self.device)], dim=1)
-
-            # Stop at EOS
-            if next_token == self.config.eos_token_id:
+        input_ids = torch.tensor([self.tokenizer.encode(prompt)], device=self.device)
+        start_time = time.time()
+        produced = 0
+        for next_tokens in self.model.generate_iter(
+            input_ids,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            do_sample=temperature > 0,
+        ):
+            token = int(next_tokens[0])
+            if token == self.config.eos_token_id:
                 break
+            produced += 1
+            yield self.tokenizer.decode([token])
+        self.total_tokens_generated += produced
+        self.total_inference_time += time.time() - start_time
 
     def get_stats(self) -> Dict[str, Any]:
         """Get generation statistics."""

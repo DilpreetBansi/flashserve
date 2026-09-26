@@ -15,48 +15,61 @@ def apply_rotary_pos_emb(
     """
     Apply Rotary Position Embeddings (RoPE) to input tensor.
 
-    RoPE applies rotation matrices to pairs of elements in the embedding space,
-    encoding absolute position information without learned parameters.
+    Uses the interleaved convention from the original Llama code: element pairs
+    (2i, 2i+1) are rotated by angle position * theta^(-2i/d).
 
     Args:
         x: Input tensor of shape (batch, seq_len, num_heads, head_dim)
-        positions: Position indices of shape (seq_len,)
+        positions: Position indices of shape (seq_len,) or (batch, seq_len)
         rope_theta: Base for the exponential in the frequency formula
 
     Returns:
-        Tensor with RoPE applied, same shape as input
+        Tensor with RoPE applied, same shape and dtype as input
     """
     assert x.shape[-1] % 2 == 0, "Head dimension must be even for RoPE"
-
     head_dim = x.shape[-1]
-    batch_size, seq_len, num_heads = x.shape[0], x.shape[1], x.shape[2]
     device = x.device
-    dtype = x.dtype
 
-    # Compute frequencies: theta_i = rope_theta^(-2i/d)
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim))
+    # Compute angles in float32 for accuracy, whatever the activation dtype.
+    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    angles = positions.to(device=device, dtype=torch.float32)[..., None] * inv_freq  # (..., seq, head_dim/2)
+    if angles.dim() == 2:          # (seq, d/2) -> (1, seq, 1, d/2)
+        angles = angles[None, :, None, :]
+    else:                          # (batch, seq, d/2) -> (batch, seq, 1, d/2)
+        angles = angles[:, :, None, :]
+    cos, sin = angles.cos(), angles.sin()
 
-    # Compute rotations: theta_i * m
-    t = positions.to(device).to(dtype)  # (seq_len,)
-    freqs = torch.einsum('i,j->ij', t, inv_freq)  # (seq_len, head_dim//2)
+    xf = x.float()
+    x_even, x_odd = xf[..., 0::2], xf[..., 1::2]
+    out = torch.stack([x_even * cos - x_odd * sin, x_even * sin + x_odd * cos], dim=-1)
+    return out.flatten(-2).to(x.dtype)
 
-    # Duplicate to get (seq_len, head_dim)
-    emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, head_dim)
 
-    # Create rotation matrix: cos(theta), sin(theta)
-    cos = emb.cos()[None, :, None, :]  # (1, seq_len, 1, head_dim)
-    sin = emb.sin()[None, :, None, :]  # (1, seq_len, 1, head_dim)
+def build_attention_mask(
+    token_mask: torch.Tensor,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Combine a causal mask with a key-padding mask.
 
-    # Apply rotation to pairs of elements
-    x_rot = torch.stack([
-        x[..., 0::2] * cos[..., 0::2] - x[..., 1::2] * sin[..., 1::2],
-        x[..., 0::2] * sin[..., 0::2] + x[..., 1::2] * cos[..., 1::2],
-    ], dim=-1)
+    Args:
+        token_mask: (batch, seq_len) bool, True for real tokens and False for padding
+        dtype: Floating dtype of the returned additive mask
 
-    # Interleave back to original shape
-    x_rot = x_rot.flatten(-2)
+    Returns:
+        Additive mask of shape (batch, 1, seq_len, seq_len): 0 where attention is
+        allowed and the dtype's minimum value where it is not.
+    """
+    seq_len = token_mask.shape[-1]
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=token_mask.device))
+    allowed = causal[None, None, :, :] & token_mask[:, None, None, :].bool()
+    mask = torch.zeros(allowed.shape, dtype=dtype, device=token_mask.device)
+    return mask.masked_fill(~allowed, torch.finfo(dtype).min)
 
-    return x_rot.to(dtype)
+
+def positions_from_mask(token_mask: torch.Tensor) -> torch.Tensor:
+    """Positions that start at 0 on each sequence's first real token (for left padding)."""
+    return (token_mask.long().cumsum(-1) - 1).clamp(min=0)
 
 
 def get_causal_mask(
